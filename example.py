@@ -6,6 +6,8 @@ import random
 import torch.functional as F
 from compiler import compile
 
+EPOCHS = 5
+
 device = torch.device('mps')
 torch.set_float32_matmul_precision('high')
 
@@ -28,41 +30,43 @@ class SimpleModel(nn.Module):
 
 
 model = SimpleModel()
-model = model.to(device)
-# model = torch.compile(model, mode='reduce-overhead', fullgraph=True)
-loss = nn.CrossEntropyLoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
-classes = ['Iris-setosa', 'Iris-versicolor', 'Iris-virginica']
-with open('iris.data') as file:
-    dataset = [line.strip().split(',') for line in file]
-dataset = [(list(map(float, x[:-1])), classes.index(x[-1])) for x in dataset]
-dataset = [[*x, y] for x, y in dataset]
-random.shuffle(dataset)
-dataset = torch.tensor(dataset, device=device)
+if EPOCHS > 0:
+    model = model.to(device)
+    # model = torch.compile(model, mode='reduce-overhead', fullgraph=True)
+    loss = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002)
 
-for i in range(5):
-    for j in range(1000):
-        data = torch.randint(len(dataset), (16,), device=device)
-        data = dataset[data]
-        x = data[:, :-1]
-        y = model(x)
-        yt = data[:, -1:]
+    classes = ['Iris-setosa', 'Iris-versicolor', 'Iris-virginica']
+    with open('iris.data') as file:
+        dataset = [line.strip().split(',') for line in file]
+    dataset = [(list(map(float, x[:-1])), classes.index(x[-1])) for x in dataset]
+    dataset = [[*x, y] for x, y in dataset]
+    random.shuffle(dataset)
+    dataset = torch.tensor(dataset, device=device)
 
-        # One-hot encode yt using eye
-        yt = torch.eye(3, device=device)[yt.long()][:, 0]
+    for i in range(EPOCHS):
+        for j in range(1000):
+            data = torch.randint(len(dataset), (16,), device=device)
+            data = dataset[data]
+            x = data[:, :-1]
+            y = model(x)
+            yt = data[:, -1:]
 
-        optimizer.zero_grad()
-        l = loss(y, yt)
-        l.backward()
-        optimizer.step()
-    print(l.item())
+            # One-hot encode yt using eye
+            yt = torch.eye(3, device=device)[yt.long()][:, 0]
 
-print('Results:')
-with torch.no_grad():
-    print(model(torch.tensor([5.9, 3.0, 5.1, 1.8], device=device)))
+            optimizer.zero_grad()
+            l = loss(y, yt)
+            l.backward()
+            optimizer.step()
+        print(l.item())
 
-model = model.to('cpu')
+    print('Results:')
+    with torch.no_grad():
+        print(model(torch.tensor([5.9, 3.0, 5.1, 1.8], device=device)))
+
+    model = model.to('cpu')
 
 
 class ModelWrapper(nn.Module):

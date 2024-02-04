@@ -1,63 +1,50 @@
+from typing import Optional
 import torch
 from torch import nn
 import torch.fx
-import functorch.compile
-import random
-import torch.functional as F
+import importlib
+
+from utils import ExcelLambda
 
 
-def build_excel_array(tensor: torch.Tensor):
+def build_excel_array(tensor: torch.Tensor, digits: Optional[int] = None) -> str:
     if tensor.dim() == 1:
         # TODO: May need to unsqueeze 1 instead
         tensor = tensor.unsqueeze(0)
     assert tensor.dim() == 2
-    return '{' + ';'.join(','.join(str(x.item()) for x in row) for row in tensor) + '}'
-
+    return '{' + ';'.join(','.join(str(x.item() if digits is None else round(x.item(), digits)) for x in row) for row in tensor) + '}'
 
 def build_excel_function(node: torch.fx.Node) -> str:
     # print(node.target.name())
     if node.kwargs != {}:
         raise NotImplementedError('kwargs not implemented')
-    match node.target.name():
-        case 'aten::view':
-            return f'WRAPROWS(TOROW({node.args[0].name}),{node.args[1][-1]})'
-        case 'aten::permute':
-            if node.args[1] == [1, 0]:
-                return f'TRANSPOSE({node.args[0].name})'
-            else:
-                return node.args[0].name
-        case 'aten::addmm':
-            return f'{node.args[0].name}+MMULT({node.args[1].name},{node.args[2].name})'
-        case 'aten::relu':
-            # MAX doesn't work because it doesn't support broadcasting
-            return f'IF({node.args[0].name}>0,{node.args[0].name},0)'
-        case 'aten::sigmoid':
-            return f'1/(1+EXP(-{node.args[0].name}))'
-        case 'aten::argmax':
-            dim = node.args[1]
-            rank = node.meta['val'].dim()
-            if dim < 0:
-                dim += rank
-            arg = node.args[0].name
-            if dim == rank - 1:
-                return f'BYROW({arg},LAMBDA(x,MATCH(MAX(x),x,0)))-1'
-            else:
-                return f'BYCOL({arg},LAMBDA(x,MATCH(MAX(x),x,0)))-1'
-        case _:
-            raise NotImplementedError(f'Function {node.target.name()} not implemented')
+    node_name = node.target.name()
+    try:
+        mod_name, fn_name = node_name.split('::')
+        mod = importlib.import_module(mod_name)
+        fn = getattr(mod, fn_name)
+        return fn(node)
+    except ModuleNotFoundError:
+        raise NotImplementedError(f'Node {node_name} not implemented')
 
     # Height of an array: =MAX(ROW(I9#))-MIN(ROW(I9#))+1
 
 
-def compile(model: nn.Module, *args, **kwargs) -> str:
+def compile(model: nn.Module, *args, digits=None, **kwargs) -> str:
     export = torch.export.export(model, args, kwargs)
     export = export.run_decompositions()
+
+    nodes = list(export.graph.nodes)
+    inputs_to_parameters = export.graph_signature.inputs_to_parameters
+    parameters = export.graph_signature.parameters
+    user_inputs = export.graph_signature.user_inputs
 
     code = ''
 
     # TODO: If a node is only used once, we can inline it
 
-    for node in reversed(export.graph.nodes):
+    # Add the function calls
+    for node in reversed(nodes):
         match node.op:
             case 'placeholder':
                 pass
@@ -70,19 +57,38 @@ def compile(model: nn.Module, *args, **kwargs) -> str:
                 code = output[0].name
 
 
+    # Add requested LAMBDAs
+    function_nodes = [node for node in nodes if node.op == 'call_function']
+    node_names = {node.target.name() for node in function_nodes}
+    lambdas: dict[str, ExcelLambda] = {}
+    for node_name in node_names:
+        try:
+            mod_name, fn_name = node_name.split('::')
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, f'{fn_name}')
+            if hasattr(fn, '_lambdas'):
+                for k, v in fn._lambdas.items():
+                    lambdas[k] = v.mangled(f'{mod_name}_{fn_name}')
+        except ModuleNotFoundError:
+            raise NotImplementedError(f'Node {node_name} not implemented')
+
+    lambda_names = ','.join(lambdas.keys())
+    lambda_args = ','.join(f'LAMBDA({",".join(lm.args)},{lm.code})' for lm in lambdas.values())
+    code = f'LAMBDA({lambda_names},{code})({lambda_args})'
+
+    # Add fixed weights as LETs
     lets = []
-    inputs_to_parameters = export.graph_signature.inputs_to_parameters
     parameters_to_inputs = {v: k for k, v in inputs_to_parameters.items()}
 
-    for parameter in export.graph_signature.parameters:
+    for parameter in parameters:
         lets.append(parameters_to_inputs[parameter])
-        lets.append(build_excel_array(model.state_dict()[parameter]))
-        # lets.append('temp')
+        lets.append(build_excel_array(model.state_dict()[parameter], digits=digits))
 
     code = f'LET({",".join(lets)},{code})'
 
+    # Add the LAMBDA wrapping
     lambda_args = []
-    for user_input in export.graph_signature.user_inputs:
+    for user_input in user_inputs:
         lambda_args.append(user_input)
 
     code = f'LAMBDA({",".join(lambda_args)},{code})'
