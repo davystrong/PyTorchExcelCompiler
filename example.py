@@ -6,7 +6,7 @@ import random
 import torch.functional as F
 from compiler import compile
 
-EPOCHS = 5
+EPOCHS = 0
 
 device = torch.device('mps')
 torch.set_float32_matmul_precision('high')
@@ -82,5 +82,12 @@ class ModelWrapper(nn.Module):
 
 model = ModelWrapper(model)
 
-code = compile(model, torch.tensor([5.9, 3.0, 5.1, 1.8]))
+def model(x: torch.Tensor) -> torch.Tensor:
+    x = x + x[:, None] + x[:, None, None]
+    x = x + torch.tensor([[0], [1], [1], [1]])
+    x = torch.sum(x, dim=0)
+    return x
+
+code = compile(model, torch.tensor([5.1, 3.5, 1.4, 0.2]))
 print(code)
+print('Expected output:', model(torch.tensor([5.1, 3.5, 1.4, 0.2])))

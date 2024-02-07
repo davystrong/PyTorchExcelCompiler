@@ -21,6 +21,7 @@ def build_excel_function(node: torch.fx.Node) -> str:
     node_name = node.target.name()
     try:
         mod_name, fn_name = node_name.split('::')
+        fn_name = fn_name.replace('.', '_')
         mod = importlib.import_module(mod_name)
         fn = getattr(mod, fn_name)
         return fn(node)
@@ -38,6 +39,8 @@ def compile(model: nn.Module, *args, digits=None, **kwargs) -> str:
     inputs_to_parameters = export.graph_signature.inputs_to_parameters
     parameters = export.graph_signature.parameters
     user_inputs = export.graph_signature.user_inputs
+    constants = export.tensor_constants
+    inputs_to_constants = export.graph_signature.inputs_to_lifted_tensor_constants
 
     code = ''
 
@@ -49,9 +52,14 @@ def compile(model: nn.Module, *args, digits=None, **kwargs) -> str:
             case 'placeholder':
                 pass
             case 'call_function':
-                code = f'LET({node.name},{build_excel_function(node)},{code})'
+                fn_code = build_excel_function(node)
+                if isinstance(fn_code, str):
+                    fn_code = {node.name: fn_code}
+                code = f'LET({",".join(x for item in fn_code.items() for x in item)},{code})'
             case 'output':
                 output = node.args[0]
+                if len(output[0].meta['val'].shape) > 2:
+                    raise NotImplementedError('Multi-dimensional outputs not possible in Excel')
                 if len(output) > 1:
                     raise NotImplementedError('Multiple outputs not implemented')
                 code = output[0].name
@@ -64,6 +72,7 @@ def compile(model: nn.Module, *args, digits=None, **kwargs) -> str:
     for node_name in node_names:
         try:
             mod_name, fn_name = node_name.split('::')
+            fn_name = fn_name.replace('.', '_')
             mod = importlib.import_module(mod_name)
             fn = getattr(mod, f'{fn_name}')
             if hasattr(fn, '_lambdas'):
@@ -72,19 +81,29 @@ def compile(model: nn.Module, *args, digits=None, **kwargs) -> str:
         except ModuleNotFoundError:
             raise NotImplementedError(f'Node {node_name} not implemented')
 
-    lambda_names = ','.join(lambdas.keys())
-    lambda_args = ','.join(f'LAMBDA({",".join(lm.args)},{lm.code})' for lm in lambdas.values())
-    code = f'LAMBDA({lambda_names},{code})({lambda_args})'
+    if len(lambdas) > 0:
+        lambda_names = ','.join(lambdas.keys())
+        lambda_args = ','.join(f'LAMBDA({",".join(lm.args)},{lm.code})' for lm in lambdas.values())
+        code = f'LAMBDA({lambda_names},{code})({lambda_args})'
 
-    # Add fixed weights as LETs
-    lets = []
-    parameters_to_inputs = {v: k for k, v in inputs_to_parameters.items()}
+    # Add fixed weights and constants as LETs
+    try:
+        lets = []
 
-    for parameter in parameters:
-        lets.append(parameters_to_inputs[parameter])
-        lets.append(build_excel_array(model.state_dict()[parameter], digits=digits))
+        parameters_to_inputs = {v: k for k, v in inputs_to_parameters.items()}
+        for parameter in parameters:
+            lets.append(parameters_to_inputs[parameter])
+            lets.append(build_excel_array(model.state_dict()[parameter], digits=digits))
 
-    code = f'LET({",".join(lets)},{code})'
+        constants_to_inputs = {v: k for k, v in inputs_to_constants.items()}
+        for constant_name, constant_value in constants.items():
+            lets.append(constants_to_inputs[constant_name])
+            lets.append(build_excel_array(constant_value, digits=digits))
+
+        if len(lets) > 0:
+            code = f'LET({",".join(lets)},{code})'
+    except AttributeError:
+        print('No parameters added')
 
     # Add the LAMBDA wrapping
     lambda_args = []
