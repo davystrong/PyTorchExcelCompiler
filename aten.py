@@ -15,7 +15,7 @@ def view(node: torch.fx.Node) -> str | dict[str, str]:
     base_array = f'WRAPROWS({base_array},{node.args[1][-1]})'
 
     codes = {}
-    dim_0_size = node.args[1][-2]
+    dim_0_size = node.args[1][-2] if len(node.args[1]) > 1 else 1
     for output_coords in _gen_coords(node.meta['val'].shape[:-2]):
         output_name = '_'.join([node.name, *map(str, output_coords)])
         output_index = _get_coords_index(node.meta['val'].shape[:-2], output_coords)
